@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -31,7 +32,11 @@ func main() {
 	http.HandleFunc("/nocache", withCache("no-cache"))
 	http.HandleFunc("/fresh", withCache("max-age=30"))
 	http.HandleFunc("/immutable", withCache("max-age=31536000, immutable"))
+	// for hashing response body
 	http.HandleFunc("/api/products", productsHandler)
+
+	http.HandleFunc("/api/products-v", versionedProductsHandler)
+	http.HandleFunc("/api/products-v/bump", bumpHandler)
 
 	log.Println("listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -75,4 +80,55 @@ func productsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(body)
+}
+
+// same as writing 2 separate lines
+// var mu sync.RWMutex
+// var version = 1
+var (
+	mu      sync.RWMutex // guards products and version
+	version = 1
+)
+
+func versionedProductsHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("HIT SERVER: %s %s If-None-Match=%q",
+		r.Method, r.URL.Path, r.Header.Get("If-None-Match"))
+
+	mu.RLock()
+	etag := fmt.Sprintf(`"v%d"`, version)
+
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("ETag", etag)
+
+	// cheap check first: no JSON, no hashing
+	if r.Header.Get("If-None-Match") == etag {
+		mu.RUnlock()
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	log.Println("BUILDING BODY") // must NOT appear on a 304
+	body, err := json.Marshal(products)
+	mu.RUnlock()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
+}
+
+// simulates "someone edited a product"
+func bumpHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	mu.Lock()
+	products[1].Price += 100
+	version++
+	v := version
+	mu.Unlock()
+	fmt.Fprintf(w, "version is now %d\n", v)
 }
